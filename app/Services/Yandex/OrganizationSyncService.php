@@ -2,12 +2,10 @@
 
 namespace App\Services\Yandex;
 
-use App\DTO\ParsedReviewData;
+use App\Enums\ParsingStatus;
 use App\Exceptions\YandexParserException;
 use App\Models\Organization;
-use App\Models\OrganizationReview;
-use App\Models\User;
-use Carbon\Carbon;
+use App\Models\ParsingRun;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -15,145 +13,136 @@ use Throwable;
 class OrganizationSyncService
 {
     public function __construct(
-        private readonly YandexMapsUrlNormalizer $urlNormalizer,
-        private readonly YandexMapsParserService $parser,
-    ) {
-    }
+        private readonly YandexMapsParserInterface $parser,
+        private readonly YandexMapsResultValidator $validator,
+        private readonly ReviewPersister $reviews,
+    ) {}
 
-    public function saveAndSync(User $user, string $sourceUrl): Organization
+    public function execute(int $runId): void
     {
-        $normalizedUrl = $this->urlNormalizer->normalize($sourceUrl);
-        $externalId = $this->urlNormalizer->extractExternalId($normalizedUrl);
-        $organization = Organization::query()->firstOrNew(['user_id' => $user->id]);
-        $urlChanged = $organization->exists && $organization->normalized_url !== $normalizedUrl;
+        $run = ParsingRun::query()->with('organization')->findOrFail($runId);
+        if (! $run->status->isActive()) {
+            return;
+        }
+        if ($run->attempt >= config('yandex.max_retries')) {
+            $this->fail($runId, new YandexParserException('YANDEX_NETWORK_ERROR', 'Maximum parser attempts reached.'));
 
-        $organization->fill([
-            'source_url' => $sourceUrl,
-            'normalized_url' => $normalizedUrl,
-            'yandex_external_id' => $externalId,
-            'scrape_status' => 'pending',
-            'scrape_error' => null,
+            return;
+        }
+        $started = microtime(true);
+        $run->update([
+            'status' => ParsingStatus::Processing, 'started_at' => $run->started_at ?? now(),
+            'attempt' => $run->attempt + 1, 'progress' => 5, 'reviews_found' => 0, 'reviews_saved' => 0,
+            'current_step' => 'Открываем Яндекс.Карты', 'error_code' => null, 'error_message' => null,
         ]);
-        $organization->save();
-
-        if ($urlChanged) {
-            $organization->reviews()->delete();
-        }
-
-        return $this->sync($organization);
-    }
-
-    public function sync(Organization $organization): Organization
-    {
-        $organization->forceFill([
-            'scrape_status' => 'processing',
-            'scrape_error' => null,
-        ])->save();
-
+        $run->organization->update(['status' => 'processing', 'last_sync_started_at' => now()]);
         try {
-            $parsed = $this->parser->parse($organization->normalized_url);
-        } catch (YandexParserException $exception) {
-            $this->markAsFailed($organization, $exception->getMessage(), $exception->rawError);
-
-            throw $exception;
-        } catch (Throwable $exception) {
-            $this->markAsFailed($organization, 'Не удалось получить данные из Яндекс.Карт.', $exception->getMessage());
-
-            throw new YandexParserException('Не удалось получить данные из Яндекс.Карт.', $exception->getMessage(), (int) $exception->getCode());
-        }
-
-        DB::transaction(function () use ($organization, $parsed): void {
-            $organization->forceFill([
-                'yandex_external_id' => $parsed->externalId ?? $organization->yandex_external_id,
-                'title' => $parsed->title,
-                'rating' => $parsed->rating,
-                'ratings_count' => $parsed->ratingsCount,
-                'reviews_count' => $parsed->reviewsCount > 0 ? $parsed->reviewsCount : count($parsed->reviews),
-                'scrape_status' => 'success',
-                'scrape_error' => null,
-                'last_scraped_at' => now(),
-                'raw_meta' => $parsed->meta,
-            ])->save();
-
-            foreach (array_slice($parsed->reviews, 0, 600) as $review) {
-                $this->upsertReview($organization, $review);
+            $this->log($run, $started);
+            // No database transaction is held during browser/network activity.
+            $parsed = $this->parser->parse($run->organization->normalized_url, function (array $event) use ($run): void {
+                $run->update([
+                    'progress' => max($run->progress, min(80, max(5, (int) ($event['progress'] ?? 5)))),
+                    'reviews_found' => max($run->reviews_found, min(2000, (int) ($event['reviews_found'] ?? 0))),
+                    'current_step' => match ($event['step'] ?? '') {
+                        'loading_reviews' => 'Загружаем отзывы',
+                        'validating' => 'Проверяем результат',
+                        default => 'Загружаем карточку организации',
+                    },
+                ]);
+            });
+            $this->validator->validate($parsed->payload);
+            if ($parsed->organization->externalId !== app(YandexMapsUrlNormalizer::class)->extractExternalId($run->organization->normalized_url)) {
+                throw new YandexParserException('YANDEX_SOURCE_STRUCTURE_CHANGED', 'Organization identity changed during navigation.');
             }
+            $run->update(['progress' => 85, 'reviews_found' => count($parsed->reviews), 'current_step' => 'Сохраняем отзывы']);
+            DB::transaction(function () use ($run, $parsed): void {
+                $lockedRun = ParsingRun::query()->lockForUpdate()->findOrFail($run->id);
+                if ($lockedRun->status !== ParsingStatus::Processing) {
+                    return;
+                }
+                $organization = Organization::query()->lockForUpdate()->findOrFail($run->organization_id);
+                $fields = ['title', 'rating', 'ratings_count', 'reviews_count'];
+                $before = $organization->only($fields);
+                $data = $parsed->organization;
+                $organization->update([
+                    'title' => $data->title, 'rating' => $data->rating, 'ratings_count' => $data->ratingsCount,
+                    'reviews_count' => $data->reviewsCount, 'external_id' => $data->externalId,
+                    'status' => 'ready', 'last_error' => null, 'last_successful_sync_at' => now(),
+                    'last_sync_finished_at' => now(), 'raw_meta' => $parsed->meta,
+                ]);
+                $saved = $this->reviews->persist($organization, $parsed->reviews);
+                $changes = [];
+                foreach ($fields as $field) {
+                    if ($before[$field] != $organization->$field) {
+                        $changes[$field] = ['from' => $before[$field], 'to' => $organization->$field];
+                    }
+                }
+                $organization->snapshots()->create([
+                    ...$organization->only($fields), 'parsing_run_id' => $run->id,
+                    'payload' => ['changes' => $changes, 'extraction' => $parsed->meta],
+                ]);
+                $lockedRun->update([
+                    'status' => ParsingStatus::Completed, 'progress' => 100, 'finished_at' => now(),
+                    'reviews_saved' => $saved, 'current_step' => 'Синхронизация завершена',
+                    'metadata' => [...($run->metadata ?? []), ...$parsed->meta, 'changes' => $changes],
+                ]);
+            }, 3);
+            $this->log($run->refresh(), $started);
+        } catch (Throwable $exception) {
+            $retry = $exception instanceof YandexParserException && $exception->retryable()
+                && $run->attempt < config('yandex.max_retries');
+            $this->fail($run->id, $exception, $retry);
+            throw $exception;
+        }
+    }
+
+    public function fail(int $runId, Throwable $exception, bool $retry = false): void
+    {
+        $code = $exception instanceof YandexParserException ? $exception->errorCode : 'INTERNAL_ERROR';
+        $message = $exception instanceof YandexParserException ? $exception->getMessage() : 'Внутренняя ошибка синхронизации. Попробуйте позже.';
+        $status = $retry ? ParsingStatus::Pending : ($code === 'YANDEX_BLOCKED' ? ParsingStatus::Blocked : ParsingStatus::Failed);
+        $run = DB::transaction(function () use ($runId, $code, $message, $status, $retry): ?ParsingRun {
+            $run = ParsingRun::query()->lockForUpdate()->find($runId);
+            if (! $run || ! $run->status->isActive()) {
+                return null;
+            }
+            $run->update([
+                'status' => $status, 'finished_at' => $retry ? null : now(), 'error_code' => $code,
+                'error_message' => $message, 'current_step' => $retry ? 'Ожидаем повторной попытки' : 'Синхронизация остановлена',
+            ]);
+            // Previous successful data is deliberately retained.
+            $run->organization()->update([
+                'status' => $status->value, 'last_error' => $message,
+                'last_sync_finished_at' => $retry ? null : now(),
+            ]);
+
+            return $run;
         });
-
-        return $organization->refresh();
-    }
-
-    private function upsertReview(Organization $organization, ParsedReviewData $review): void
-    {
-        $contentHash = $this->contentHash($review);
-
-        $reviewModel = null;
-
-        if ($review->externalId !== null) {
-            $reviewModel = OrganizationReview::query()
-                ->where('organization_id', $organization->id)
-                ->where('external_id', $review->externalId)
-                ->first();
+        if (! $run) {
+            return;
         }
-
-        if ($reviewModel === null) {
-            $reviewModel = OrganizationReview::query()
-                ->where('organization_id', $organization->id)
-                ->where('content_hash', $contentHash)
-                ->first();
-        }
-
-        $reviewModel ??= new OrganizationReview(['organization_id' => $organization->id]);
-
-        $reviewModel->fill([
-            'external_id' => $review->externalId ?? $reviewModel->external_id,
-            'content_hash' => $contentHash,
-            'author' => $review->author,
-            'review_date' => $this->parseDate($review->date),
-            'text' => $review->text,
-            'rating' => $review->rating,
-            'raw_payload' => $review->raw,
+        // A log storage failure must not roll back the terminal business state.
+        Log::warning('yandex.sync.failed', [
+            'organization_id' => $run->organization_id, 'parsing_run_id' => $run->id,
+            'status' => $status->value, 'attempt' => $run->attempt, 'error_code' => $code,
+            'reviews_found' => $run->reviews_found, 'reviews_saved' => $run->reviews_saved,
+            'duration_ms' => $run->started_at ? (int) $run->started_at->diffInMilliseconds(now()) : 0,
+            'exception' => get_class($exception),
+            'detail' => $exception instanceof YandexParserException ? $exception->detail : 'See internal exception report',
+            'trace' => $exception->getTraceAsString(),
         ]);
-
-        $reviewModel->save();
-    }
-
-    private function contentHash(ParsedReviewData $review): string
-    {
-        return hash('sha256', implode('|', [
-            mb_strtolower($review->externalId ?? ''),
-            mb_strtolower($review->author ?? ''),
-            $review->date ?? '',
-            mb_strtolower($review->text ?? ''),
-            (string) ($review->rating ?? ''),
-        ]));
-    }
-
-    private function parseDate(?string $date): ?string
-    {
-        if ($date === null) {
-            return null;
-        }
-
-        try {
-            return Carbon::parse($date)->toDateString();
-        } catch (Throwable) {
-            return null;
+        if (! $exception instanceof YandexParserException) {
+            report($exception);
         }
     }
 
-    private function markAsFailed(Organization $organization, string $safeMessage, ?string $rawError): void
+    private function log(ParsingRun $run, float $started): void
     {
-        $organization->forceFill([
-            'scrape_status' => 'failed',
-            'scrape_error' => $safeMessage,
-            'last_scraped_at' => now(),
-        ])->save();
-
-        Log::warning('Yandex organization sync failed', [
-            'organization_id' => $organization->id,
-            'safe_message' => $safeMessage,
-            'raw_error' => $rawError,
+        Log::info('yandex.sync.'.$run->status->value, [
+            'organization_id' => $run->organization_id, 'parsing_run_id' => $run->id,
+            'status' => $run->status->value, 'attempt' => $run->attempt,
+            'duration_ms' => (int) ((microtime(true) - $started) * 1000),
+            'reviews_found' => $run->reviews_found, 'reviews_saved' => $run->reviews_saved, 'error_code' => $run->error_code,
         ]);
     }
 }

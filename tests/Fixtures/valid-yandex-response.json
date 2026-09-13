@@ -1,0 +1,36 @@
+{
+  "organization": {
+    "external_id": "123456789",
+    "title": "Demo Place",
+    "rating": 4.7,
+    "ratings_count": 1234,
+    "reviews_count": 2
+  },
+  "reviews": [
+    {
+      "external_id": "review-1",
+      "author": "Anna",
+      "date": "2026-01-10",
+      "text": "Good place.",
+      "rating": 5,
+      "raw": {}
+    },
+    {
+      "external_id": "review-2",
+      "author": "Timur",
+      "date": "2026-01-11",
+      "text": "Works as expected.",
+      "rating": 4,
+      "raw": {}
+    }
+  ],
+  "meta": {
+    "source": "yandex_maps",
+    "organization_found": true,
+    "reviews_container_found": true,
+    "html_length": 20000,
+    "reviews_loaded": 2,
+    "stop_reason": "declared_count",
+    "coverage": "full"
+  }
+}

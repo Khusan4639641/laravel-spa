@@ -20,7 +20,9 @@ class SaveOrganizationRequest extends FormRequest
     {
         return [
             'source_url' => [
+                'bail',
                 'required',
+                'string',
                 'url',
                 'max:2048',
                 function (string $attribute, mixed $value, callable $fail): void {

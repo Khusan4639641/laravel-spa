@@ -8,7 +8,6 @@ use App\Http\Resources\UserResource;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
 {
@@ -17,9 +16,7 @@ class AuthController extends Controller
         $credentials = $request->validated();
 
         if (! Auth::attempt($credentials)) {
-            throw ValidationException::withMessages([
-                'email' => ['Неверный email или пароль.'],
-            ]);
+            return response()->json(['message' => 'Неверный email или пароль.'], 401);
         }
 
         $request->session()->regenerate();

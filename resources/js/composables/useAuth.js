@@ -42,14 +42,15 @@ export function useAuth() {
 
         try {
             await http.post('/api/logout');
-        } finally {
             user.value = null;
             initialized.value = true;
+        } finally {
             loading.value = false;
         }
     }
 
     return {
+        clearUser: () => { user.value = null; initialized.value = true; },
         user: readonly(user),
         loading: readonly(loading),
         initialized: readonly(initialized),

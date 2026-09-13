@@ -31,6 +31,14 @@ class User extends Authenticatable
         ];
     }
 
+    public function selectedOrganization(): ?Organization
+    {
+        return $this->organizations()->when(
+            $this->current_organization_id,
+            fn ($query) => $query->whereKey($this->current_organization_id),
+        )->latest('id')->first();
+    }
+
     public function organizations(): HasMany
     {
         return $this->hasMany(Organization::class);

@@ -4,7 +4,9 @@
     "type": "module",
     "scripts": {
         "build": "vite build",
-        "dev": "vite"
+        "dev": "vite",
+        "test:parser": "PLAYWRIGHT_BROWSERS_PATH=\"$PWD/storage/app/playwright\" node --test tests/Browser/extraction.test.mjs",
+        "test:browser": "PLAYWRIGHT_BROWSERS_PATH=\"$PWD/storage/app/playwright\" node --test tests/Browser/app.test.mjs"
     },
     "devDependencies": {
         "@tailwindcss/vite": "^4.0.0",

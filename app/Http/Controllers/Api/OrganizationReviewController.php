@@ -4,7 +4,6 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Http\Resources\OrganizationReviewResource;
-use App\Models\Organization;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -19,10 +18,7 @@ class OrganizationReviewController extends Controller
 
         $perPage = (int) ($validated['per_page'] ?? 50);
 
-        $organization = Organization::query()
-            ->where('user_id', $request->user()->id)
-            ->latest('id')
-            ->first();
+        $organization = $request->user()->selectedOrganization();
 
         if (! $organization) {
             return response()->json([

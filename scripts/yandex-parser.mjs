@@ -1,456 +1,171 @@
 import { chromium } from 'playwright';
-import crypto from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { extractDocument, inspectBlock } from './yandex-extraction.mjs';
 
-const url = process.argv[2];
-const MAX_REVIEWS = Number.parseInt(process.env.YANDEX_MAX_REVIEWS ?? '600', 10);
-const MAX_SCROLLS = Number.parseInt(process.env.YANDEX_MAX_SCROLLS ?? '80', 10);
-const STALE_SCROLL_LIMIT = Number.parseInt(process.env.YANDEX_STALE_SCROLLS ?? '6', 10);
-
-if (!url) {
-    process.stderr.write('Yandex Maps organization URL is required.\n');
-    process.exit(1);
-}
-
+const provided = JSON.parse(process.argv[3] || '{}');
+const integer = (key, env, fallback, min, max) => Math.max(min, Math.min(max, Number(provided[key] ?? process.env[env] ?? fallback) || fallback));
+const options = {
+    timeout: integer('timeout_ms', 'YANDEX_TIMEOUT_MS', 60000, 1000, 120000),
+    totalTimeout: integer('total_timeout_ms', 'YANDEX_TOTAL_TIMEOUT_MS', 300000, 5000, 1800000),
+    maxReviews: integer('max_reviews', 'YANDEX_MAX_REVIEWS', 600, 1, 2000),
+    maxScrolls: integer('max_scrolls', 'YANDEX_MAX_SCROLLS', 150, 1, 500),
+    delayMin: integer('request_delay_min_ms', 'YANDEX_REQUEST_DELAY_MIN_MS', 1500, 0, 30000),
+    delayMax: integer('request_delay_max_ms', 'YANDEX_REQUEST_DELAY_MAX_MS', 4000, 0, 30000),
+};
+const allowedHosts = ['yandex.ru', 'yandex.com', 'yandex.uz', 'yandex.kz', 'yandex.by', 'yandex.com.tr'];
+const officialHost = host => allowedHosts.includes(host.replace(/^www\./, ''));
+const resourceHost = host => officialHost(host) || ['yastatic.net', 'yandex.net', 'yandex.ru', 'yandex.com', 'yandex.uz', 'yandex.kz', 'yandex.by', 'yandex.com.tr'].some(domain => host === domain || host.endsWith(`.${domain}`));
+const fail = (code, detail) => { throw Object.assign(new Error(detail), { code }); };
+const progress = (step, percent, count = 0) => process.stderr.write(`${JSON.stringify({ type: 'progress', step, progress: percent, reviews_found: count })}\n`);
 let browser;
+let timer;
+let interrupted = false;
+let blockedResponse = false;
+let reviewNetworkFailure = false;
+const delay = async page => {
+    const max = Math.max(options.delayMin, options.delayMax);
+    await page.waitForTimeout(options.delayMin + Math.floor(Math.random() * (max - options.delayMin + 1)));
+};
+const cleanup = async () => { await browser?.close().catch(() => {}); };
+process.once('SIGTERM', async () => { await cleanup(); process.exit(1); });
+process.once('SIGINT', async () => { await cleanup(); process.exit(1); });
 
 try {
-    browser = await chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage'],
-    });
-
-    const context = await browser.newContext({
-        locale: 'ru-RU',
-        userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
-        viewport: { width: 1366, height: 900 },
-    });
-
-    const page = await context.newPage();
-    page.setDefaultTimeout(30000);
-
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(2500);
-
-    await assertNotBlocked(page);
-    await openReviews(page);
-    await expandVisibleTexts(page);
-    await scrollReviews(page);
-    await expandVisibleTexts(page);
-    await assertNotBlocked(page);
-
-    const payload = await page.evaluate(() => {
-        const textOf = (root, selectors) => {
-            for (const selector of selectors) {
-                const node = root.querySelector(selector);
-                const value = node?.textContent?.trim();
-
-                if (value) {
-                    return value.replace(/\s+/g, ' ');
-                }
-            }
-
-            return null;
-        };
-
-        const attrOf = (root, selectors, attribute) => {
-            for (const selector of selectors) {
-                const node = root.querySelector(selector);
-                const value = node?.getAttribute(attribute)?.trim();
-
-                if (value) {
-                    return value;
-                }
-            }
-
-            return null;
-        };
-
-        const normalizeNumber = (value) => {
-            if (value === null || value === undefined) {
-                return null;
-            }
-
-            const normalized = String(value)
-                .replace(',', '.')
-                .replace(/[^\d.]/g, '');
-
-            if (!normalized) {
-                return null;
-            }
-
-            const parsed = Number.parseFloat(normalized);
-
-            return Number.isFinite(parsed) ? parsed : null;
-        };
-
-        const parseCount = (value) => {
-            if (!value) {
-                return 0;
-            }
-
-            const match = value.replace(/\u00a0/g, ' ').match(/(\d[\d\s.,]*)/);
-
-            if (!match) {
-                return 0;
-            }
-
-            return Number.parseInt(match[1].replace(/[^\d]/g, ''), 10) || 0;
-        };
-
-        const parseRatingFromNode = (root) => {
-            const ratingText = textOf(root, [
-                '[class*="business-rating-badge-view__rating"]',
-                '[class*="business-summary-rating-badge-view__rating"]',
-                '[class*="business-card-title-view__rating"]',
-                '[aria-label*="рейтинг"]',
-                '[aria-label*="ейтинг"]',
-                '[aria-label*="rating"]',
-            ]);
-
-            const rating = normalizeNumber(ratingText);
-
-            if (rating !== null && rating >= 0 && rating <= 5) {
-                return rating;
-            }
-
-            const ariaNode = root.querySelector('[aria-label*="5"], [aria-label*="4"], [aria-label*="3"], [aria-label*="2"], [aria-label*="1"]');
-            const ariaRating = normalizeNumber(ariaNode?.getAttribute('aria-label'));
-
-            if (ariaRating !== null && ariaRating >= 1 && ariaRating <= 5) {
-                return ariaRating;
-            }
-
-            return null;
-        };
-
-        const reviewSelectors = [
-            '[class*="business-review-view"]',
-            '[class*="business-reviews-card-view__review"]',
-            '[itemprop="review"]',
-            '[data-testid*="review"]',
-        ];
-
-        const reviewNodes = [...new Set(reviewSelectors.flatMap((selector) => [...document.querySelectorAll(selector)]))]
-            .filter((node) => {
-                const text = node.textContent?.trim() ?? '';
-
-                return text.length > 20;
-            });
-
-        const parseReviewRating = (node) => {
-            const explicit = attrOf(node, ['meta[itemprop="ratingValue"]'], 'content');
-            const explicitRating = normalizeNumber(explicit);
-
-            if (explicitRating !== null && explicitRating >= 1 && explicitRating <= 5) {
-                return Math.round(explicitRating);
-            }
-
-            const ariaCandidates = [...node.querySelectorAll('[aria-label]')].map((element) => element.getAttribute('aria-label') ?? '');
-            for (const label of ariaCandidates) {
-                const match = label.match(/(?:оценка|rating|рейтинг)\s*[:\-]?\s*(\d)/i) ?? label.match(/(\d)\s*(?:из|out of)\s*5/i);
-
-                if (match) {
-                    return Math.max(1, Math.min(5, Number.parseInt(match[1], 10)));
-                }
-            }
-
-            const fullStars = node.querySelectorAll('[class*="star"][class*="_full"], [class*="star"][class*="full"]').length;
-
-            return fullStars >= 1 && fullStars <= 5 ? fullStars : null;
-        };
-
-        const title = textOf(document, [
-            'h1',
-            '[class*="business-card-title-view__title"]',
-            '[class*="orgpage-header-view__header"]',
-            '[class*="card-title-view__title"]',
-        ]) ?? document.title.split(/[—|-]/)[0]?.trim() ?? null;
-
-        const rating = parseRatingFromNode(document);
-        const bodyText = document.body?.innerText ?? '';
-        const ratingsCountMatch = bodyText.match(/(\d[\d\s.,]*)\s+(?:оценк|rating|ratings|баҳол|bahol)/i);
-        const reviewsCountMatch = bodyText.match(/(\d[\d\s.,]*)\s+(?:отзыв|review|reviews|sharh|шарх)/i);
-
-        const reviews = reviewNodes.map((node) => {
-            const rawText = node.textContent?.replace(/\s+/g, ' ').trim() ?? '';
-            const author = textOf(node, [
-                '[class*="business-review-view__author"]',
-                '[class*="business-review-view__user-name"]',
-                '[class*="user-name"]',
-                '[itemprop="author"]',
-            ]);
-            const rawDate = attrOf(node, ['meta[itemprop="datePublished"]'], 'content') ?? textOf(node, [
-                '[class*="business-review-view__date"]',
-                '[class*="business-review-view__date"] time',
-                'time',
-            ]);
-            const text = textOf(node, [
-                '[class*="business-review-view__body-text"]',
-                '[class*="business-review-view__text"]',
-                '[itemprop="reviewBody"]',
-                '[data-testid*="review-text"]',
-            ]) ?? rawText;
-            const explicitId = node.getAttribute('data-review-id')
-                ?? node.getAttribute('data-id')
-                ?? node.id
-                ?? null;
-
-            return {
-                external_id: explicitId,
-                author,
-                date: normalizeDate(rawDate),
-                text,
-                rating: parseReviewRating(node),
-                raw: {
-                    raw_date: rawDate,
-                    raw_text: rawText,
-                },
-            };
-        }).filter((review) => review.text || review.author);
-
-        return {
-            organization: {
-                title,
-                rating,
-                ratings_count: parseCount(ratingsCountMatch?.[0]),
-                reviews_count: parseCount(reviewsCountMatch?.[0]) || reviews.length,
-                external_id: extractExternalId(location.href),
-                meta: {
-                    url: location.href,
-                    collected_reviews: reviews.length,
-                },
-            },
-            reviews,
-        };
-
-        function normalizeDate(value) {
-            if (!value) {
-                return null;
-            }
-
-            const input = value.replace(/\u00a0/g, ' ').trim().toLowerCase();
-            const iso = input.match(/\d{4}-\d{2}-\d{2}/)?.[0];
-
-            if (iso) {
-                return iso;
-            }
-
-            const dotted = input.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
-
-            if (dotted) {
-                return `${dotted[3]}-${dotted[2].padStart(2, '0')}-${dotted[1].padStart(2, '0')}`;
-            }
-
-            const months = {
-                января: '01',
-                февраль: '02',
-                февраля: '02',
-                марта: '03',
-                апреля: '04',
-                мая: '05',
-                июня: '06',
-                июля: '07',
-                августа: '08',
-                сентября: '09',
-                октября: '10',
-                ноября: '11',
-                декабря: '12',
-                january: '01',
-                february: '02',
-                march: '03',
-                april: '04',
-                may: '05',
-                june: '06',
-                july: '07',
-                august: '08',
-                september: '09',
-                october: '10',
-                november: '11',
-                december: '12',
-            };
-            const textual = input.match(/(\d{1,2})\s+([a-zа-яё]+)\s+(\d{4})/i);
-
-            if (textual && months[textual[2]]) {
-                return `${textual[3]}-${months[textual[2]]}-${textual[1].padStart(2, '0')}`;
-            }
-
-            return null;
-        }
-
-        function extractExternalId(value) {
-            const match = value.match(/\/org\/[^/]+\/(\d+)/);
-
-            return match?.[1] ?? null;
-        }
-    });
-
-    const dedupedReviews = dedupeReviews(payload.reviews).slice(0, MAX_REVIEWS);
-    payload.reviews = dedupedReviews;
-
-    if (!payload.organization.title && payload.organization.rating === null && dedupedReviews.length === 0) {
-        fail('Could not find organization data. Yandex markup may have changed or the page is unavailable.');
+    const source = new URL(process.argv[2]);
+    if (source.protocol !== 'https:' || !officialHost(source.hostname) || source.port || source.username || source.password
+        || !/^\/maps\/org\/(?:[^/]+\/)?\d+\/(?:reviews\/?)?$/.test(source.pathname)) {
+        fail('YANDEX_SOURCE_STRUCTURE_CHANGED', 'Invalid organization URL.');
     }
-
+    browser = await chromium.launch({ headless: true, chromiumSandbox: provided.chromium_sandbox ?? process.env.YANDEX_CHROMIUM_SANDBOX !== 'false', timeout: 15000 });
+    timer = setTimeout(async () => { interrupted = true; await cleanup(); }, options.totalTimeout);
+    const context = await browser.newContext({
+        locale: 'ru-RU', viewport: { width: 1366, height: 900 }, serviceWorkers: 'block', acceptDownloads: false,
+        ...(provided.user_agent ? { userAgent: provided.user_agent } : {}),
+    });
+    let requestCount = 0;
+    await context.route('**/*', async route => {
+        const request = route.request();
+        const target = new URL(request.url());
+        requestCount++;
+        const mainNavigation = request.isNavigationRequest() && request.frame().parentFrame() === null;
+        if (requestCount > 2500 || !['http:', 'https:'].includes(target.protocol) || target.port
+            || !resourceHost(target.hostname) || (mainNavigation && (!officialHost(target.hostname) || !/^\/(?:maps|showcaptcha|captcha)(?:\/|$)/.test(target.pathname)))
+            || ['image', 'media', 'font'].includes(request.resourceType())) {
+            await route.abort();
+        } else await route.continue();
+    });
+    const page = await context.newPage();
+    context.on('page', popup => { if (popup !== page) popup.close().catch(() => {}); });
+    page.setDefaultTimeout(8000);
+    page.setDefaultNavigationTimeout(options.timeout);
+    page.on('response', response => {
+        const request = response.request();
+        const relevant = request.isNavigationRequest() || ['xhr', 'fetch'].includes(request.resourceType()) && /review/i.test(new URL(response.url()).pathname);
+        if (relevant && [401, 403, 429].includes(response.status())) blockedResponse = true;
+        if (relevant && response.status() >= 500) reviewNetworkFailure = true;
+    });
+    page.on('requestfailed', request => {
+        if (['xhr', 'fetch'].includes(request.resourceType()) && /review/i.test(new URL(request.url()).pathname)) reviewNetworkFailure = true;
+    });
+    const assertHealthy = async () => {
+        if (blockedResponse || await page.evaluate(inspectBlock)) fail('YANDEX_BLOCKED', 'Source returned a blocking/challenge signal.');
+        if (reviewNetworkFailure) fail('YANDEX_NETWORK_ERROR', 'Review loading request failed.');
+        if (requestCount > 2500) fail('YANDEX_SOURCE_STRUCTURE_CHANGED', 'Resource budget exhausted.');
+    };
+    progress('opening', 8);
+    await delay(page);
+    const response = await page.goto(source.href, { waitUntil: 'domcontentloaded' });
+    await assertHealthy();
+    if (!response || response.status() >= 400) fail('YANDEX_SOURCE_STRUCTURE_CHANGED', 'Organization page not found.');
+    await page.waitForSelector('h1, form[action*="captcha"], .CheckboxCaptcha', { timeout: options.timeout }).catch(async () => {
+        await assertHealthy();
+        fail('YANDEX_SOURCE_STRUCTURE_CHANGED', 'No organization heading or valid page content.');
+    });
+    await delay(page);
+    await assertHealthy();
+    let initial = await page.evaluate(extractDocument);
+    // Navigate to the public reviews tab, not an undocumented JSON endpoint.
+    if (!source.pathname.includes('/reviews')) {
+        const target = new URL(page.url());
+        target.pathname = target.pathname.replace(/\/$/, '') + '/reviews/';
+        target.search = '';
+        await delay(page);
+        await page.goto(target.href, { waitUntil: 'domcontentloaded' });
+        await delay(page);
+        await assertHealthy();
+    }
+    await page.waitForSelector('.business-reviews-card-view, .business-review-view, [itemprop="review"], .business-reviews-card-view__empty', { timeout: options.timeout }).catch(async () => {
+        await assertHealthy();
+        fail('YANDEX_SOURCE_STRUCTURE_CHANGED', 'Expected reviews container not found.');
+    });
+    const collected = new Map();
+    let stale = 0;
+    let stopReason;
+    let payload;
+    for (let iteration = 0; iteration < options.maxScrolls; iteration++) {
+        await assertHealthy();
+        // Expansions are scoped to review bodies. Do not click arbitrary links named "More".
+        const expand = page.locator('.business-review-view__expand, .business-review-view__more');
+        for (const button of (await expand.all()).slice(0, 50)) {
+            if (await button.isVisible()) await button.click({ timeout: 1000 }).catch(() => {});
+        }
+        payload = await page.evaluate(extractDocument);
+        // Counters may be absent from the reviews tab. Use previously observed exact values only.
+        for (const field of ['title', 'rating', 'ratings_count', 'reviews_count']) payload.organization[field] ??= initial.organization[field];
+        payload.meta.organization_found ||= initial.meta.organization_found;
+        const previousSize = collected.size;
+        for (const review of payload.reviews) {
+            const key = review.external_id || createHash('sha256').update(JSON.stringify([review.author, review.date, review.rating, review.text])).digest('hex');
+            collected.set(key, review);
+        }
+        const expected = payload.organization.reviews_count;
+        progress('loading_reviews', Math.min(80, 15 + Math.floor(collected.size / Math.max(1, Math.min(expected ?? options.maxReviews, options.maxReviews)) * 65)), collected.size);
+        if (expected !== null && collected.size >= expected) { stopReason = 'declared_count'; break; }
+        if (collected.size >= options.maxReviews) { stopReason = 'limit'; break; }
+        stale = collected.size === previousSize ? stale + 1 : 0;
+        if (stale >= 6) {
+            const loading = await page.locator('.business-reviews-card-view__loader, .business-reviews-card-view .spin2_progress_yes').count();
+            if (loading) fail('YANDEX_NETWORK_ERROR', 'Reviews remain in loading state.');
+            stopReason = 'exhausted'; break;
+        }
+        const scrolled = await page.evaluate(() => {
+            const review = [...document.querySelectorAll('.business-review-view, [itemprop="review"]')].at(-1);
+            if (!review) return false;
+            let parent = review.parentElement;
+            while (parent && parent !== document.body) {
+                if (parent.scrollHeight > parent.clientHeight + 20 && /(auto|scroll)/.test(getComputedStyle(parent).overflowY)) {
+                    parent.scrollTop = parent.scrollHeight;
+                    return true;
+                }
+                parent = parent.parentElement;
+            }
+            review.scrollIntoView({ block: 'end' });
+            window.scrollTo(0, document.body.scrollHeight);
+            return document.documentElement.scrollHeight > window.innerHeight;
+        });
+        if (!scrolled && expected > collected.size) fail('YANDEX_SOURCE_STRUCTURE_CHANGED', 'Review scroll container not found.');
+        await delay(page);
+    }
+    if (!stopReason) fail('YANDEX_NETWORK_ERROR', 'Maximum scroll iterations reached before extraction finished.');
+    await assertHealthy();
+    payload.reviews = [...collected.values()].slice(0, options.maxReviews);
+    payload.meta = {
+        ...payload.meta, reviews_loaded: payload.reviews.length, stop_reason: stopReason,
+        coverage: payload.reviews.length >= payload.organization.reviews_count ? 'full' : 'available_only',
+        declared_reviews_count: payload.organization.reviews_count,
+    };
+    progress('validating', 80, payload.reviews.length);
     process.stdout.write(`${JSON.stringify(payload)}\n`);
 } catch (error) {
-    const message = normalizeFailure(error);
-    process.stderr.write(`${message}\n`);
+    const code = error.code?.startsWith('YANDEX_') ? error.code
+        : interrupted || error.name === 'TimeoutError' || /net::ERR_|Timeout/i.test(error.message) ? 'YANDEX_NETWORK_ERROR'
+        : 'YANDEX_PARSER_UNAVAILABLE';
+    // No page HTML, cookies, environment, or raw browser exception text in process output.
+    const detail = error.code?.startsWith('YANDEX_') ? error.message
+        : interrupted ? 'Total extraction deadline exceeded.' : `${error.name || 'Error'} during browser execution.`;
+    process.stdout.write(`${JSON.stringify({ error: { code, detail } })}\n`);
     process.exitCode = 1;
 } finally {
-    await browser?.close().catch(() => {});
-}
-
-async function openReviews(page) {
-    const reviewTexts = [
-        /Отзывы/i,
-        /Все отзывы/i,
-        /Reviews/i,
-        /All reviews/i,
-        /Sharhlar/i,
-    ];
-
-    for (const text of reviewTexts) {
-        const locator = page.getByText(text).first();
-
-        if (await locator.count().catch(() => 0)) {
-            await locator.click({ timeout: 5000 }).catch(() => {});
-            await page.waitForTimeout(1500);
-            return;
-        }
-    }
-
-    const current = new URL(page.url());
-    current.searchParams.set('tab', 'reviews');
-    await page.goto(current.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(2000);
-}
-
-async function scrollReviews(page) {
-    let previousCount = 0;
-    let staleScrolls = 0;
-
-    for (let i = 0; i < MAX_SCROLLS; i += 1) {
-        const count = await page.evaluate(() => {
-            const selectors = [
-                '[class*="business-review-view"]',
-                '[class*="business-reviews-card-view__review"]',
-                '[itemprop="review"]',
-                '[data-testid*="review"]',
-            ];
-
-            return new Set(selectors.flatMap((selector) => [...document.querySelectorAll(selector)])).size;
-        });
-
-        if (count >= MAX_REVIEWS) {
-            break;
-        }
-
-        if (count <= previousCount) {
-            staleScrolls += 1;
-        } else {
-            staleScrolls = 0;
-            previousCount = count;
-        }
-
-        if (staleScrolls >= STALE_SCROLL_LIMIT) {
-            break;
-        }
-
-        await page.evaluate(() => {
-            const review = document.querySelector('[class*="business-review-view"], [itemprop="review"], [data-testid*="review"]');
-            let container = review?.parentElement ?? null;
-
-            while (container && container !== document.body) {
-                const style = window.getComputedStyle(container);
-                const canScroll = container.scrollHeight > container.clientHeight + 80;
-
-                if (canScroll && /(auto|scroll)/.test(`${style.overflowY}${style.overflow}`)) {
-                    container.scrollTop = container.scrollHeight;
-                    return;
-                }
-
-                container = container.parentElement;
-            }
-
-            window.scrollTo(0, document.body.scrollHeight);
-        });
-
-        await page.mouse.wheel(0, 2200).catch(() => {});
-        await page.waitForTimeout(900);
-        await expandVisibleTexts(page);
-    }
-}
-
-async function expandVisibleTexts(page) {
-    const patterns = [/Ещё/i, /Показать полностью/i, /Read more/i, /More/i, /Yana/i];
-
-    for (const pattern of patterns) {
-        const matches = await page.getByText(pattern).all().catch(() => []);
-
-        for (const match of matches.slice(0, 20)) {
-            await match.click({ timeout: 1000 }).catch(() => {});
-        }
-    }
-}
-
-async function assertNotBlocked(page) {
-    const blocked = await page.evaluate(() => {
-        const text = document.body?.innerText?.toLowerCase() ?? '';
-
-        return location.href.includes('showcaptcha')
-            || text.includes('captcha')
-            || text.includes('капча')
-            || text.includes('робот')
-            || text.includes('robot')
-            || text.includes('доступ ограничен')
-            || text.includes('access denied');
-    });
-
-    if (blocked) {
-        fail('Yandex blocked automated access or captcha required');
-    }
-}
-
-function dedupeReviews(reviews) {
-    const seen = new Set();
-    const result = [];
-
-    for (const review of reviews) {
-        const key = review.external_id || crypto
-            .createHash('sha256')
-            .update([review.author, review.date, review.text, review.rating].join('|'))
-            .digest('hex');
-
-        if (seen.has(key)) {
-            continue;
-        }
-
-        seen.add(key);
-        result.push(review);
-    }
-
-    return result;
-}
-
-function normalizeFailure(error) {
-    const message = String(error?.message ?? error ?? '');
-
-    if (message.includes('Executable doesn\'t exist') || message.includes('browserType.launch')) {
-        return 'Playwright Chromium is not installed. Run: npx playwright install chromium';
-    }
-
-    if (message.includes('Yandex blocked automated access') || message.toLowerCase().includes('captcha')) {
-        return 'Yandex blocked automated access or captcha required';
-    }
-
-    if (message.toLowerCase().includes('timeout')) {
-        return 'Yandex Maps page did not load in time.';
-    }
-
-    return message.split('\n')[0].slice(0, 300) || 'Yandex Maps parser failed.';
-}
-
-function fail(message) {
-    throw new Error(message);
+    clearTimeout(timer);
+    await cleanup();
 }

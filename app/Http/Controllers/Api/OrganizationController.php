@@ -2,12 +2,10 @@
 
 namespace App\Http\Controllers\Api;
 
-use App\Exceptions\YandexParserException;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\SaveOrganizationRequest;
 use App\Http\Resources\OrganizationResource;
-use App\Models\Organization;
-use App\Services\Yandex\OrganizationSyncService;
+use App\Services\Yandex\OrganizationSyncScheduler;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -15,62 +13,26 @@ class OrganizationController extends Controller
 {
     public function show(Request $request): JsonResponse
     {
-        $organization = $this->currentOrganization($request);
+        $organization = $request->user()->selectedOrganization();
 
-        return response()->json([
-            'data' => $organization ? new OrganizationResource($organization) : null,
-        ]);
+        return response()->json(['data' => $organization ? new OrganizationResource($organization->load('latestRun')) : null]);
     }
 
-    public function store(SaveOrganizationRequest $request, OrganizationSyncService $syncService): JsonResponse
+    public function store(SaveOrganizationRequest $request, OrganizationSyncScheduler $scheduler): JsonResponse
     {
-        try {
-            $organization = $syncService->saveAndSync($request->user(), $request->validated('source_url'));
-        } catch (YandexParserException $exception) {
-            return $this->parserErrorResponse($request, $exception->getMessage());
-        }
+        $run = $scheduler->schedule($request->user(), $request->validated('source_url'));
 
-        return response()->json([
-            'data' => new OrganizationResource($organization),
-        ]);
+        return response()->json(['data' => [
+            'organization_id' => $run->organization_id, 'parsing_run_id' => $run->id, 'status' => $run->status->value,
+        ]], 202);
     }
 
-    public function sync(Request $request, OrganizationSyncService $syncService): JsonResponse
+    public function sync(Request $request, OrganizationSyncScheduler $scheduler): JsonResponse
     {
-        $organization = $this->currentOrganization($request);
+        $run = $scheduler->schedule($request->user());
 
-        if (! $organization) {
-            return response()->json([
-                'message' => 'Сначала сохраните ссылку на организацию.',
-            ], 404);
-        }
-
-        try {
-            $organization = $syncService->sync($organization);
-        } catch (YandexParserException $exception) {
-            return $this->parserErrorResponse($request, $exception->getMessage());
-        }
-
-        return response()->json([
-            'data' => new OrganizationResource($organization),
-        ]);
-    }
-
-    private function currentOrganization(Request $request): ?Organization
-    {
-        return Organization::query()
-            ->where('user_id', $request->user()->id)
-            ->latest('id')
-            ->first();
-    }
-
-    private function parserErrorResponse(Request $request, string $message): JsonResponse
-    {
-        $organization = $this->currentOrganization($request);
-
-        return response()->json([
-            'message' => $message,
-            'data' => $organization ? new OrganizationResource($organization) : null,
-        ], 502);
+        return response()->json(['data' => [
+            'organization_id' => $run->organization_id, 'parsing_run_id' => $run->id, 'status' => $run->status->value,
+        ]], 202);
     }
 }
